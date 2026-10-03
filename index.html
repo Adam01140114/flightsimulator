@@ -3,7 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<style>body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<style>body{margin:0}img{max-width:100%}[hidden]{display:none!important}.padlink{text-transform:none;letter-spacing:0}
+.padlink.on{color:#7ad37a}
+</style>
 </head>
 <body>
 <title>Halcyon Skies</title>
@@ -313,12 +315,190 @@ body.touch #mini{display:none}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<!-- Multiplayer through server.js (missing when the page is opened another way; then Claude's room is used if there is one) -->
+<script src="/socket.io/socket.io.js"></script>
 <script>
 (() => {
 'use strict';
 const $ = s => document.querySelector(s);
 const ARTIFACT_URL = 'https://claude.ai/artifact/TFbyN8a9xvcgFnv4xriWYV';
 const HASH = (location.hash || '').slice(1).toLowerCase();
+/* ---------- Rooms on our own server (server.js) ---------- */
+// The same interface as Claude's room: join(name) -> { presence(patch), peers(), onPeers(cb), leave() }.
+// Presences go through the server. In couch mode each phone (r: 'pad') also opens a
+// WebRTC link straight to the TV (r: 'tv') over their Wi-Fi and sends its presence that way; the server copy
+// then only goes out twice a second (for anyone joining later). Every presence carries
+// a counter, so whichever way it arrives, an older one never replaces a newer one.
+const ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
+let netBase = null;
+function netRooms(){
+  if (netBase) return netBase;
+  const socket = window.io({ reconnectionDelayMax: 2000 });
+  const handles = new Map();
+  socket.on('room:peer', (m) => { const h = handles.get(m.name); if (h) h._peer(m.peer, m.presence, m.q, 'server'); });
+  socket.on('room:gone', (m) => { const h = handles.get(m.name); if (h) h._gone(m.peer); });
+  socket.on('room:signal', (m) => { const h = handles.get(m.name); if (h) h._signal(m.from, m.data); });
+  socket.on('connect', () => { for (const h of handles.values()) h._rejoin(); });
+  netBase = { join: (name) => openRoom(name) };
+  // For checking from the console: window.halcyonNet.rooms.get('hs-<code>').stats
+  window.halcyonNet = { socket, rooms: handles };
+  return netBase;
+
+  function openRoom(name){
+    const peers = new Map();     // socket id -> { peer, presence, q, link, retryAt }
+    let mine = {}, q = 0, left = false, lastServer = 0, serverTimer = null;
+    let self = null; // this page's id in the room: the TV hands out player slots by id
+    const listeners = [], lostListeners = [];
+    const notify = () => { const ch = { peers: h.peers() }; for (const cb of listeners) { try { cb(ch); } catch (e) {} } };
+    const entry = (id) => { let p = peers.get(id); if (!p) { p = { peer: id, presence: null, q: 0, link: null, retryAt: 0 }; peers.set(id, p); } return p; };
+    const toServer = () => { lastServer = Date.now(); clearTimeout(serverTimer); serverTimer = null; socket.emit('room:presence', { name, presence: mine, q }); };
+    const h = {
+      stats: { server: 0, direct: 0 }, // updates received each way
+      presence(patch){
+        if (left || !patch) return Promise.resolve();
+        for (const k in patch) { if (patch[k] === null || patch[k] === undefined) delete mine[k]; else mine[k] = patch[k]; }
+        q++;
+        const msg = JSON.stringify({ t: 'p', presence: mine, q });
+        let allDirect = peers.size > 0;
+        for (const p of peers.values()) {
+          if (p.link && p.link.open) { try { p.link.ch.send(msg); } catch (e) { allDirect = false; } }
+          else allDirect = false;
+        }
+        if (!allDirect) toServer();
+        else if (Date.now() - lastServer > 500) toServer();
+        else if (!serverTimer) serverTimer = setTimeout(toServer, 500);
+        connect();
+        return Promise.resolve();
+      },
+      // Everyone in the room, this page included (sameTab), as Claude's room lists them
+      peers(){
+        const list = [...peers.values()].filter(p => p.presence).map(p => ({ peer: p.peer, presence: p.presence, sameTab: false, direct: !!(p.link && p.link.open) }));
+        list.push({ peer: self, presence: mine, sameTab: true, direct: false });
+        return list;
+      },
+      // cb({ peers }) now and on every change; onLost() if the room can't be rejoined after a drop
+      onPeers(cb, onLost){
+        listeners.push(cb); if (onLost) lostListeners.push(onLost);
+        setTimeout(() => { if (!left && listeners.includes(cb)) { try { cb({ peers: h.peers() }); } catch (e) {} } });
+        return () => { const i = listeners.indexOf(cb); if (i >= 0) listeners.splice(i, 1); };
+      },
+      leave(){
+        left = true; clearTimeout(serverTimer);
+        for (const p of peers.values()) closeLink(p);
+        peers.clear(); handles.delete(name);
+        socket.emit('room:leave', { name });
+        return Promise.resolve();
+      },
+      _peer(id, presence, pq, via){
+        const p = entry(id);
+        if (!presence || pq <= p.q) return;
+        p.presence = presence; p.q = pq;
+        if (via) h.stats[via]++;
+        notify(); connect();
+      },
+      _gone(id){ const p = peers.get(id); if (!p) return; closeLink(p); peers.delete(id); notify(); },
+      _rejoin(){
+        if (left) return;
+        socket.emit('room:join', { name }, (res) => {
+          if (!res || res.err) { for (const cb of lostListeners) { try { cb(); } catch (e) {} } return; }
+          self = res.self;
+          for (const x of res.peers) h._peer(x.peer, x.presence, x.q, 'server');
+          if (Object.keys(mine).length) { q++; toServer(); }
+        });
+      },
+      _signal(from, data){
+        if (left || !data) return;
+        const p = entry(from);
+        if (data.d && data.d.type === 'offer') {
+          closeLink(p);
+          const link = openLink(p, false);
+          link.chain = link.pc.setRemoteDescription(data.d)
+            .then(() => link.pc.createAnswer()).then(a => link.pc.setLocalDescription(a))
+            .then(() => signal(p, { d: link.pc.localDescription })).catch(() => dropLink(p));
+        } else if (p.link && data.d) {
+          const link = p.link; link.chain = link.chain.then(() => link.pc.setRemoteDescription(data.d)).catch(() => dropLink(p));
+        } else if (p.link && data.c) {
+          const link = p.link; link.chain = link.chain.then(() => link.pc.addIceCandidate(data.c)).catch(() => {});
+        }
+      }
+    };
+    const signal = (p, data) => socket.emit('room:signal', { name, to: p.peer, data });
+    // Couch: a phone opens the direct link to the TV
+    function connect(){
+      if (left || mine.r !== 'pad' || !window.RTCPeerConnection) return;
+      for (const p of peers.values()) {
+        if (p.presence && p.presence.r === 'tv' && !p.link && Date.now() >= p.retryAt) {
+          const link = openLink(p, true);
+          link.pc.createOffer().then(o => link.pc.setLocalDescription(o))
+            .then(() => signal(p, { d: link.pc.localDescription })).catch(() => dropLink(p));
+        }
+      }
+    }
+    function openLink(p, offerer){
+      const pc = new RTCPeerConnection({ iceServers: ICE });
+      const link = p.link = { pc, ch: null, open: false, chain: Promise.resolve() };
+      pc.onicecandidate = (e) => { if (e.candidate && p.link === link) signal(p, { c: e.candidate }); };
+      pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && p.link === link) dropLink(p); };
+      const useChannel = (ch) => {
+        link.ch = ch;
+        ch.onopen = () => {
+          if (p.link !== link) return;
+          link.open = true;
+          if (Object.keys(mine).length) { try { ch.send(JSON.stringify({ t: 'p', presence: mine, q })); } catch (e) {} }
+          notify();
+        };
+        ch.onmessage = (m) => { try { const d = JSON.parse(m.data); if (d.t === 'p') h._peer(p.peer, d.presence, +d.q || 0, 'direct'); } catch (e) {} };
+        ch.onclose = () => { if (p.link === link) dropLink(p); };
+      };
+      if (offerer) useChannel(pc.createDataChannel('presence', { ordered: true }));
+      else pc.ondatachannel = (e) => useChannel(e.channel);
+      return link;
+    }
+    // Lost or never opened: back to the server, try again in a few seconds
+    function dropLink(p){
+      const was = p.link && p.link.open;
+      closeLink(p); p.retryAt = Date.now() + 4000;
+      if (was) { toServer(); notify(); }
+      setTimeout(connect, 4100);
+    }
+    function closeLink(p){
+      if (!p.link) return;
+      try { p.link.pc.close(); } catch (e) {}
+      p.link = null;
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject({ code: 'timeout' }), 10000);
+      socket.emit('room:join', { name }, (res) => {
+        clearTimeout(timer);
+        if (!res || res.err) return reject({ code: (res && res.err) || 'error' });
+        handles.set(name, h);
+        self = res.self;
+        for (const x of res.peers) h._peer(x.peer, x.presence, x.q, 'server');
+        resolve(h);
+      });
+    });
+  }
+}
+
+// The address a phone or the other computer opens: the game itself, but on
+// localhost the computer's Wi-Fi address (a phone can't reach "localhost")
+const onClaude = () => !!(window.claude && typeof window.claude.use === 'function');
+const gameBaseP = (() => {
+  if (onClaude()) return Promise.resolve(ARTIFACT_URL);
+  const here = location.origin + location.pathname;
+  if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname)) return Promise.resolve(here);
+  return fetch('/api/lan').then(r => r.json())
+    .then(j => (j && j.origins && j.origins[0]) ? j.origins[0] + location.pathname : here)
+    .catch(() => here);
+})();
+let gameBase = onClaude() ? ARTIFACT_URL : location.origin + location.pathname;
+gameBaseP.then(b => { gameBase = b; });
+// Inside Claude: its room. Served by server.js: our own rooms (netRooms above)
+function roomApi(){
+  if (onClaude()) return Promise.resolve(window.claude.use('room')).catch(() => null);
+  return Promise.resolve(window.io ? netRooms() : null);
+}
+
 if (/^pad-[a-z0-9]{4,12}$/.test(HASH)) { runPad(HASH.slice(4)); return; }
 if (!window.THREE) { document.getElementById('app').innerHTML = '<div id="err">The 3D engine could not load. Check your connection and reload the page.</div>'; return; }
 const V3 = THREE.Vector3, Q = THREE.Quaternion;
@@ -1602,7 +1782,7 @@ function drawMini(){
 /* ---------- Versus ---------- */
 const P1_COL = '#e0533c', P2_COL = '#3b8ce0', WIN_KILLS = 5;
 let pvp = null;
-const roomP = (window.claude && typeof window.claude.use === 'function') ? Promise.resolve(window.claude.use('room')).catch(() => null) : Promise.resolve(null);
+const roomP = roomApi();
 const SPAWNS = (() => {
   let m = 0;
   for (let z = -2000; z <= 2000; z += 50) m = Math.max(m, ground(0, z), ground(-150, z), ground(150, z));
@@ -1635,7 +1815,7 @@ function pilotDown(P, reason){
   else if (P === player) { toast(reason, true); setWarn(''); }
 }
 function newPvp(kind, role, code, room){ return { kind, role, code, room, phase: 'wait', match: 0, slots: [null, null], oppPeer: null, myPeer: null, hudT: 0, lastS: null, recvAt: 0, countT: 0 }; }
-function roomLink(){ return ARTIFACT_URL + '#' + (pvp.kind === 'couch' ? 'pad-' : 'on-') + pvp.code; }
+function roomLink(){ return gameBase + '#' + (pvp.kind === 'couch' ? 'pad-' : 'on-') + pvp.code; }
 
 // Lobby UI
 const lob = { el: $('#lobby'), title: $('#lTitle'), sub: $('#lSub'), choose: $('#lChoose'), roomBox: $('#lRoom'), qr: $('#qr'), link: $('#lLink'), code: $('#lCode'), slots: $('#lSlots'), note: $('#lNote') };
@@ -1648,13 +1828,13 @@ function openVersus(){
   lob.title.textContent = 'Versus';
   lobbyMsg('Two pilots, one island. First to five kills wins.');
   lob.choose.hidden = false; lob.roomBox.hidden = true;
-  lob.note.textContent = 'Everyone who joins needs to be signed in to Claude and able to open this page.';
+  lob.note.textContent = onClaude() ? 'Everyone who joins needs to be signed in to Claude and able to open this page.' : '';
 }
 async function hostRoom(kind){
   lob.choose.hidden = true; lobbyMsg('Opening a room…');
   const api = await roomP;
   if (state !== 'lobby') return;
-  if (!api) { lobbyMsg('Live rooms are not available in this view. Open the game on claude.ai while signed in.'); lob.choose.hidden = false; return; }
+  if (!api) { lobbyMsg(onClaude() ? 'Live rooms are not available in this view. Open the game on claude.ai while signed in.' : 'Could not reach the game server. Check your connection and try again.'); lob.choose.hidden = false; return; }
   const code = makeCode();
   let room;
   try { room = await api.join('hs-' + code); }
@@ -1663,14 +1843,19 @@ async function hostRoom(kind){
   pvp = newPvp(kind, kind === 'couch' ? 'tv' : 'host', code, room);
   room.presence(kind === 'couch' ? { r: 'tv', sl: [null, null], ph: 'wait' } : { r: 'host', m: 0 }).catch(() => {});
   room.onPeers(onPvpPeers, () => lobbyMsg('The connection to the room was lost. Go back and open a new room.'));
+  await gameBaseP; // on localhost, the Wi-Fi address for the QR code
+  if (!pvp || pvp.room !== room) return;
+  if (!onClaude()) lob.note.textContent = kind === 'couch'
+    ? 'Phones on the same Wi-Fi as this screen connect straight to it, so the controls feel instant.'
+    : 'Your opponent can join from anywhere with this link.';
   showRoom();
 }
 async function openGuest(code){
   state = 'lobby'; $('#menu').hidden = true; lob.el.hidden = false; lob.choose.hidden = true; lob.roomBox.hidden = true;
   lob.title.textContent = 'Online duel'; lobbyMsg(`Joining room ${code}…`);
-  lob.note.textContent = 'You need to be signed in to Claude for the duel to connect.';
+  lob.note.textContent = onClaude() ? 'You need to be signed in to Claude for the duel to connect.' : '';
   const api = await roomP;
-  if (!api) { lobbyMsg('Live rooms are not available in this view. Sign in to Claude and open the link again.'); return; }
+  if (!api) { lobbyMsg(onClaude() ? 'Live rooms are not available in this view. Sign in to Claude and open the link again.' : 'Could not reach the game server. Check your connection and open the link again.'); return; }
   let room;
   try { room = await api.join('hs-' + code); }
   catch (e) { lobbyMsg('Could not join that room. Ask your opponent for a fresh link.'); return; }
@@ -2090,7 +2275,7 @@ function runPad(code){
   const pad = document.createElement('div'); pad.id = 'pad';
   pad.innerHTML = `
     <div class="padtop">
-      <div class="padwho"><div class="eyebrow">Halcyon Skies controller</div><div class="padname" id="padName">Connecting</div></div>
+      <div class="padwho"><div class="eyebrow">Halcyon Skies controller <span class="padlink" id="padLink"></span></div><div class="padname" id="padName">Connecting</div></div>
       <div class="padscore"><span id="padScore">0–0</span><div class="padhp"><i id="padHp"></i></div></div>
     </div>
     <p class="padstatus" id="padStatus">Joining room ${code}…</p>
@@ -2142,8 +2327,8 @@ function runPad(code){
   document.addEventListener('gesturestart', e => e.preventDefault());
 
   (async () => {
-    const api = window.claude && typeof window.claude.use === 'function' ? await Promise.resolve(window.claude.use('room')).catch(() => null) : null;
-    if (!api) { q('#padName').textContent = 'Not connected'; status('This phone cannot reach the room. Sign in to Claude on this phone, then scan the code again.'); return; }
+    const api = await roomApi();
+    if (!api) { q('#padName').textContent = 'Not connected'; status(onClaude() ? 'This phone cannot reach the room. Sign in to Claude on this phone, then scan the code again.' : 'This phone cannot reach the game. Check its connection and scan the code again.'); return; }
     try { room = await api.join('hs-' + code); }
     catch (e) { q('#padName').textContent = 'Not connected'; status('Could not join this room. Scan the code on the TV again.'); return; }
     send();
@@ -2151,6 +2336,8 @@ function runPad(code){
     room.onPeers(ch => {
       const me = ch.peers.find(p => p.sameTab), tv = ch.peers.find(p => p.presence && p.presence.r === 'tv');
       if (!tv) { q('#padName').textContent = 'Waiting'; status('Waiting for the TV screen. Keep this page open.'); return; }
+      // How this phone reaches the TV: straight over the Wi-Fi, or through the server
+      if (tv.direct !== undefined) { const lk = tv.direct ? '· ⚡ Direct to the TV' : '· Via the server'; if (q('#padLink').textContent !== lk) { q('#padLink').textContent = lk; q('#padLink').classList.toggle('on', tv.direct); } }
       const sl = Array.isArray(tv.presence.sl) ? tv.presence.sl : [];
       const idx = me ? sl.indexOf(me.peer) : -1;
       pad.classList.toggle('p1', idx === 0); pad.classList.toggle('p2', idx === 1);

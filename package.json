@@ -1,0 +1,17 @@
+{
+  "name": "halcyon-skies",
+  "version": "1.0.0",
+  "description": "Halcyon Skies - a three.js flight game with couch (phones as controllers) and online versus",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  }
+}
